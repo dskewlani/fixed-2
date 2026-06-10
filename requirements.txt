@@ -1,0 +1,18 @@
+streamlit>=1.32.0
+yfinance>=0.2.38
+pandas>=2.0.0
+numpy>=1.26.0
+plotly>=5.20.0
+requests>=2.31.0
+ta>=0.11.0
+streamlit-autorefresh>=1.0.1
+psycopg2-binary
+
+nsepython>=2.0.0
+
+# Angel One SmartAPI — real-time LTP for equity, options, futures (NFO)
+# Enables WebSocket tick streaming for sub-second price updates
+smartapi-python==1.5.5
+pyotp>=2.8.0
+logzero>=1.7.0
+websocket-client>=1.6.4   # required for SmartWebSocketV2

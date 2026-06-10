@@ -1,0 +1,423 @@
+"""
+angel_api.py
+------------
+Angel One SmartAPI wrapper for Streamlit apps.
+
+Fill in your credentials in the CONFIG section below (or load from
+environment variables / st.secrets). Everything else is ready to use.
+
+Install the dependency first:
+    pip install smartapi-python pyotp
+
+Usage:
+    import angel_api
+    status = angel_api.get_status()          # {"authenticated": bool, ...}
+    ltp    = angel_api.get_ltp("NSE", "RELIANCE", "2885")
+    orders = angel_api.get_order_book()
+    angel_api.place_order(...)
+    angel_api.logout()
+"""
+
+import os
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+# Option A: hard-code here (for local dev only — never commit secrets!)
+API_KEY     = os.getenv("ANGEL_API_KEY",     "WKZ1Ve6i")
+CLIENT_ID   = os.getenv("ANGEL_CLIENT_ID",   "K258077")
+PASSWORD    = os.getenv("ANGEL_PASSWORD",     "1811")   # login PIN / password
+TOTP_SECRET = os.getenv("ANGEL_TOTP_SECRET", "HBIWFBUKBUJ4XXNY6MUTE65WIM")
+
+# Option B (recommended for Streamlit Cloud): put the above in .streamlit/secrets.toml
+# and load like:
+#   import streamlit as st
+#   API_KEY = st.secrets["ANGEL_API_KEY"]
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Internal state
+_obj   = None   # SmartConnect instance
+_data  = {}     # session data returned after login
+_authenticated = False
+
+
+def _is_stub_config() -> bool:
+    """Returns True if credentials are still the placeholder defaults."""
+    return (
+        API_KEY     == "YOUR_API_KEY"     or
+        CLIENT_ID   == "YOUR_CLIENT_ID"   or
+        TOTP_SECRET == "YOUR_TOTP_SECRET"
+    )
+
+
+# ── AUTH ──────────────────────────────────────────────────────────────────────
+
+def login() -> dict:
+    """
+    Authenticate with Angel One using SmartAPI + TOTP.
+    Returns the session dict on success, raises on failure.
+    """
+    global _obj, _data, _authenticated
+
+    if _is_stub_config():
+        logger.warning("angel_api: using STUB mode — credentials not set.")
+        _authenticated = False
+        return {"status": False, "message": "Stub mode — fill in credentials"}
+
+    try:
+        import pyotp
+        from SmartApi import SmartConnect
+
+        totp = pyotp.TOTP(TOTP_SECRET).now()
+
+        _obj  = SmartConnect(api_key=API_KEY)
+        _data = _obj.generateSession(CLIENT_ID, PASSWORD, totp)
+
+        if _data and _data.get("status"):
+            _authenticated = True
+            logger.info("angel_api: login successful for %s", CLIENT_ID)
+            return _data
+        else:
+            _authenticated = False
+            logger.error("angel_api: login failed — %s", _data)
+            return _data or {"status": False, "message": "Unknown login error"}
+
+    except ImportError as e:
+        raise ImportError(
+            "Missing dependency. Run:  pip install smartapi-python pyotp"
+        ) from e
+    except Exception as e:
+        _authenticated = False
+        logger.exception("angel_api: login exception")
+        raise
+
+
+def logout() -> dict:
+    """Terminate the current session."""
+    global _obj, _data, _authenticated
+    if _obj and _authenticated:
+        try:
+            result = _obj.terminateSession(CLIENT_ID)
+            _authenticated = False
+            _obj = None
+            _data = {}
+            return result
+        except Exception as e:
+            logger.exception("angel_api: logout failed")
+            raise
+    _authenticated = False
+    return {"status": True, "message": "No active session"}
+
+
+def ensure_logged_in():
+    """Auto-login if not already authenticated."""
+    if not _authenticated:
+        login()
+
+
+# ── STATUS ────────────────────────────────────────────────────────────────────
+
+def get_status() -> dict:
+    """
+    Returns a status dict consumed by your Streamlit dashboard.
+
+    Shape:
+        {
+            "authenticated": bool,
+            "configured": bool,   # True if real credentials are set (even if not yet logged in)
+            "client_id": str,
+            "stub_mode": bool,
+            "message": str,
+            "session_data": dict | None,
+        }
+    """
+    if _is_stub_config():
+        return {
+            "authenticated": False,
+            "configured": False,
+            "client_id": CLIENT_ID,
+            "stub_mode": True,
+            "message": "Stub mode — set ANGEL_API_KEY, ANGEL_CLIENT_ID, ANGEL_PASSWORD, ANGEL_TOTP_SECRET",
+            "session_data": None,
+        }
+
+    return {
+        "authenticated": _authenticated,
+        "configured": True,       # credentials are set; login may or may not have run yet
+        "client_id": CLIENT_ID,
+        "stub_mode": False,
+        "message": "Connected" if _authenticated else "Not logged in",
+        "session_data": _data if _authenticated else None,
+    }
+
+
+# ── MARKET DATA ───────────────────────────────────────────────────────────────
+
+def get_ltp(exchange: str, symbol: str, token: str) -> dict:
+    """
+    Fetch Last Traded Price for a symbol.
+
+    Args:
+        exchange : "NSE" | "BSE" | "NFO" | "MCX"
+        symbol   : e.g. "RELIANCE"
+        token    : Angel One instrument token, e.g. "2885"
+
+    Returns:
+        {"ltp": float, "exchange": str, "symbol": str}
+    """
+    ensure_logged_in()
+    try:
+        resp = _obj.ltpData(exchange, symbol, token)
+        if resp and resp.get("status"):
+            return {
+                "ltp":      resp["data"]["ltp"],
+                "exchange": exchange,
+                "symbol":   symbol,
+            }
+        raise ValueError(f"LTP fetch failed: {resp}")
+    except Exception:
+        logger.exception("angel_api: get_ltp failed")
+        raise
+
+
+def get_market_data(mode: str, exchange_tokens: dict) -> dict:
+    """
+    Fetch full market data (OHLC, depth, etc.).
+
+    Args:
+        mode            : "LTP" | "OHLC" | "FULL"
+        exchange_tokens : {"NSE": ["2885", "1594"], "BSE": [...]}
+
+    Returns:
+        Raw API response dict.
+    """
+    ensure_logged_in()
+    try:
+        resp = _obj.getMarketData(mode, exchange_tokens)
+        return resp
+    except Exception:
+        logger.exception("angel_api: get_market_data failed")
+        raise
+
+
+def get_candle_data(
+    token: str,
+    exchange: str,
+    symbol_token: str,
+    interval: str,
+    from_date: str,
+    to_date: str,
+) -> list:
+    """
+    Fetch OHLCV candle data.
+
+    Args:
+        token        : instrument token
+        exchange     : "NSE" | "BSE" | "NFO"
+        symbol_token : same as token (SmartAPI quirk)
+        interval     : "ONE_MINUTE" | "FIVE_MINUTE" | "ONE_HOUR" | "ONE_DAY" etc.
+        from_date    : "YYYY-MM-DD HH:MM"
+        to_date      : "YYYY-MM-DD HH:MM"
+
+    Returns:
+        List of [timestamp, open, high, low, close, volume]
+    """
+    ensure_logged_in()
+    try:
+        param = {
+            "exchange":    exchange,
+            "symboltoken": symbol_token,
+            "interval":    interval,
+            "fromdate":    from_date,
+            "todate":      to_date,
+        }
+        resp = _obj.getCandleData(param)
+        if resp and resp.get("status"):
+            return resp["data"]
+        raise ValueError(f"Candle fetch failed: {resp}")
+    except Exception:
+        logger.exception("angel_api: get_candle_data failed")
+        raise
+
+
+# ── PORTFOLIO / ORDERS ────────────────────────────────────────────────────────
+
+def get_order_book() -> list:
+    """Returns list of today's orders."""
+    ensure_logged_in()
+    try:
+        resp = _obj.orderBook()
+        return resp.get("data") or []
+    except Exception:
+        logger.exception("angel_api: get_order_book failed")
+        raise
+
+
+def get_trade_book() -> list:
+    """Returns list of today's trades."""
+    ensure_logged_in()
+    try:
+        resp = _obj.tradeBook()
+        return resp.get("data") or []
+    except Exception:
+        logger.exception("angel_api: get_trade_book failed")
+        raise
+
+
+def get_positions() -> list:
+    """Returns current open positions."""
+    ensure_logged_in()
+    try:
+        resp = _obj.position()
+        return resp.get("data") or []
+    except Exception:
+        logger.exception("angel_api: get_positions failed")
+        raise
+
+
+def get_holdings() -> list:
+    """Returns long-term holdings."""
+    ensure_logged_in()
+    try:
+        resp = _obj.holding()
+        return resp.get("data") or []
+    except Exception:
+        logger.exception("angel_api: get_holdings failed")
+        raise
+
+
+def get_funds() -> dict:
+    """Returns available margin / funds."""
+    ensure_logged_in()
+    try:
+        resp = _obj.rmsLimit()
+        return resp.get("data") or {}
+    except Exception:
+        logger.exception("angel_api: get_funds failed")
+        raise
+
+
+# ── ORDER PLACEMENT ───────────────────────────────────────────────────────────
+
+def place_order(
+    symbol: str,
+    token: str,
+    exchange: str,
+    transaction_type: str,   # "BUY" | "SELL"
+    quantity: int,
+    price: float = 0,
+    order_type: str = "MARKET",   # "MARKET" | "LIMIT" | "SL" | "SL-M"
+    product_type: str = "INTRADAY",  # "INTRADAY" | "DELIVERY" | "CARRYFORWARD"
+    duration: str = "DAY",
+    trigger_price: float = 0,
+    variety: str = "NORMAL",   # "NORMAL" | "STOPLOSS" | "AMO"
+) -> str:
+    """
+    Place an order. Returns the order ID on success.
+
+    Example:
+        order_id = angel_api.place_order(
+            symbol="RELIANCE",
+            token="2885",
+            exchange="NSE",
+            transaction_type="BUY",
+            quantity=1,
+        )
+    """
+    ensure_logged_in()
+    try:
+        order_params = {
+            "variety":          variety,
+            "tradingsymbol":    symbol,
+            "symboltoken":      token,
+            "transactiontype":  transaction_type,
+            "exchange":         exchange,
+            "ordertype":        order_type,
+            "producttype":      product_type,
+            "duration":         duration,
+            "price":            str(price),
+            "squareoff":        "0",
+            "stoploss":         "0",
+            "triggerprice":     str(trigger_price),
+            "quantity":         str(quantity),
+        }
+        resp = _obj.placeOrder(order_params)
+        if resp and resp.get("status"):
+            order_id = resp["data"]["orderid"]
+            logger.info("angel_api: order placed — %s", order_id)
+            return order_id
+        raise ValueError(f"Order placement failed: {resp}")
+    except Exception:
+        logger.exception("angel_api: place_order failed")
+        raise
+
+
+def cancel_order(order_id: str, variety: str = "NORMAL") -> bool:
+    """Cancel an open order. Returns True on success."""
+    ensure_logged_in()
+    try:
+        resp = _obj.cancelOrder(order_id, variety)
+        return bool(resp and resp.get("status"))
+    except Exception:
+        logger.exception("angel_api: cancel_order failed")
+        raise
+
+
+def modify_order(
+    order_id: str,
+    quantity: int,
+    price: float,
+    order_type: str = "LIMIT",
+    variety: str = "NORMAL",
+    duration: str = "DAY",
+    trigger_price: float = 0,
+) -> bool:
+    """Modify an open order. Returns True on success."""
+    ensure_logged_in()
+    try:
+        params = {
+            "variety":      variety,
+            "orderid":      order_id,
+            "ordertype":    order_type,
+            "producttype":  "INTRADAY",
+            "duration":     duration,
+            "price":        str(price),
+            "quantity":     str(quantity),
+            "triggerprice": str(trigger_price),
+        }
+        resp = _obj.modifyOrder(params)
+        return bool(resp and resp.get("status"))
+    except Exception:
+        logger.exception("angel_api: modify_order failed")
+        raise
+
+
+# ── INSTRUMENT SEARCH ─────────────────────────────────────────────────────────
+
+def search_scrip(exchange: str, query: str) -> list:
+    """
+    Search for instruments by name/symbol.
+
+    Returns list of matching instruments with token, symbol, etc.
+    """
+    ensure_logged_in()
+    try:
+        resp = _obj.searchScrip(exchange, query)
+        return resp.get("data") or []
+    except Exception:
+        logger.exception("angel_api: search_scrip failed")
+        raise
+
+
+# ── CONVENIENCE ───────────────────────────────────────────────────────────────
+
+def get_profile() -> dict:
+    """Returns the logged-in user's profile."""
+    ensure_logged_in()
+    try:
+        resp = _obj.getProfile(_data.get("data", {}).get("refreshToken", ""))
+        return resp.get("data") or {}
+    except Exception:
+        logger.exception("angel_api: get_profile failed")
+        raise
